@@ -10,12 +10,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import asynccontextmanager
 from pydantic import ValidationError
 
-from . import database
+from . import database, scoring
 from .review import solve_review_plan
 from .schemas import (
     OVERRIDABLE_FIELDS,
+    ArbitrationIn,
     AuditEventOut,
     ExamTaskIn,
+    PaperScoreSheetOut,
     QuotaConfirmIn,
     QuotaConfirmOut,
     QuotaLeaseOut,
@@ -26,6 +28,7 @@ from .schemas import (
     ReviewPlanIn,
     ReviewPlanOut,
     ReviseTaskIn,
+    ScoreEntryIn,
     SeatPlanIn,
     SeatPlanOut,
     TaskAuditOut,
@@ -58,8 +61,9 @@ app = FastAPI(
         "按题号扣减的题目曝光配额及可过期预留租约（lease），"
         "面向已完成且可行任务的盲审分配，"
         "以及面向已完成且含 2~5 份平行卷的可行任务的考场卷别排布"
+        "，以及面向已完成可行任务首个候选卷组的双评录分与仲裁"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -363,7 +367,7 @@ def revise_task(task_id: int, payload: ReviseTaskIn) -> TaskCreated:
     }
     seed = int(source_req.get("seed") or 42)
     name = payload.name if payload.name is not None else row["name"]
-    new_task_id = database.create_task(
+    new_task_id, _ = database.create_task(
         name,
         json.dumps(frozen, ensure_ascii=False),
         seed,
@@ -608,3 +612,249 @@ def get_task_audit(task_id: int) -> TaskAuditOut:
         break_point=break_point,
         last_hash=event_rows[-1]["hash"] if event_rows else None,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 录分：已完成可行任务首个候选卷组上的初评/复评/仲裁（乐观版本，持久化）
+# --------------------------------------------------------------------------- #
+def _scorable_paper(task_id: int, paper: int):
+    """校验任务可录分并返回 (逐卷题号列表, 题号->题目分值)。
+
+    任务不存在 404；任务未完成 / 无结果 / 结果不可行 422；卷号越界 422。
+    """
+    row = database.get_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    try:
+        paper_count, papers, score_map = scoring.load_task_papers(row)
+    except scoring.TaskNotScorableError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if paper < 0 or paper >= paper_count:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"卷号 {paper} 不存在：该任务首个候选卷组共 {paper_count} 份卷"
+                f"（卷号 0~{paper_count - 1}）"
+            ),
+        )
+    return papers, score_map
+
+
+def _decode_id(raw: str, what: str):
+    """解码路径中的考生标识/题号；非 int/str（布尔、浮点、数组等）一律 422。"""
+    value = scoring.decode_id_key(raw)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{what} 必须是整数或字符串（收到 {type(value).__name__}）；"
+                f"整数与字符串形式严格区分"
+            ),
+        )
+    return value
+
+
+def _resolve_question(question_raw: str, selected_ids: List[Any], score_map: Dict[str, int]):
+    """题号必须属于该卷（首个候选卷组冻结题目），返回 (题号, 存储键, 题目分值)。"""
+    qid = _decode_id(question_raw, "题号")
+    if qid not in selected_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"题号 {qid!r} 不在该卷题目中；该卷仅允许题目 {selected_ids}"
+            ),
+        )
+    return qid, scoring.encode_id_key(qid), score_map[qid]
+
+
+def _build_sheet(
+    task_id: int, paper: int, examinee_id: Any, selected_ids: List[Any]
+) -> PaperScoreSheetOut:
+    rows = database.get_paper_score_rows(
+        task_id, paper, scoring.encode_id_key(examinee_id)
+    )
+    data = scoring.build_score_sheet(task_id, paper, examinee_id, selected_ids, rows)
+    return PaperScoreSheetOut(**data)
+
+
+@app.put(
+    "/api/tasks/{task_id}/papers/{paper}/examinees/{examinee_raw}/questions/{question_raw}/scores",
+    response_model=PaperScoreSheetOut,
+    response_model_exclude_none=True,
+)
+def put_question_score(
+    task_id: int,
+    paper: int,
+    examinee_raw: str,
+    question_raw: str,
+    payload: ScoreEntryIn,
+) -> PaperScoreSheetOut:
+    """录入/修改某考生某题的**初评或复评**分（持久化）。
+
+    路径：任务号、卷号（从 0 起）、考生标识、题号（均须属于首个候选卷组）；
+    体：``initial_score`` 或 ``review_score``（恰好一个，0 至题目分值的整数）
+    及改分时必填的 ``version``。
+
+    - 该题首次录分或**补评**（填补缺失的初评/复评空槽）：无需 version，
+      每题版本从 0 起；
+    - 已有该轮分数再提交即**改分**：必须携带当前 version，成功后版本 +1，
+      且**旧仲裁立即撤销**；同分重复提交幂等（版本不变）；
+    - 改分缺 version 返回 422（code=version_required）；版本不符返回
+      409（code=version_conflict），**不写入任何内容**。
+
+    返回与 GET 同一结构的最新成绩单（同快照逐题两评分、有效分、版本、
+    待处理原因；全卷每题均有有效分时附总分）。
+    """
+    papers, score_map = _scorable_paper(task_id, paper)
+    selected_ids = papers[paper]
+    examinee_id = _decode_id(examinee_raw, "考生标识")
+    qid, question_key, max_score = _resolve_question(
+        question_raw, selected_ids, score_map
+    )
+    if payload.score > max_score:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{'初评' if payload.stage == 'initial' else '复评'}分 {payload.score}"
+                f" 超出第 {qid!r} 题分值上限 {max_score}（允许 0~{max_score} 的整数）"
+            ),
+        )
+
+    code, _ = database.put_paper_score(
+        task_id,
+        paper,
+        scoring.encode_id_key(examinee_id),
+        question_key,
+        payload.stage,
+        payload.score,
+        payload.version,
+    )
+    if code == "version_missing":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "该轮评分已存在，提交即改分，必须携带当前 version",
+                "code": "version_required",
+            },
+        )
+    if code == "version_conflict":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "版本不符：题目已被其他请求改动，未写入",
+                "code": "version_conflict",
+            },
+        )
+    return _build_sheet(task_id, paper, examinee_id, selected_ids)
+
+
+@app.post(
+    "/api/tasks/{task_id}/papers/{paper}/examinees/{examinee_raw}/questions/{question_raw}/arbitration",
+    response_model=PaperScoreSheetOut,
+    response_model_exclude_none=True,
+)
+def arbitrate_question_score(
+    task_id: int,
+    paper: int,
+    examinee_raw: str,
+    question_raw: str,
+    payload: ArbitrationIn,
+) -> PaperScoreSheetOut:
+    """录入/修改某考生某题的**仲裁分**（持久化）。
+
+    仲裁**仅限初评、复评齐备且相差超过 1 分**：缺轮须先补评（422，
+    code=awaiting_review）；分差不超过 1 分时两评均值即为有效分，不允许仲裁
+    （422，code=arbitration_not_needed）。仲裁分须为 0 至题目分值的整数；
+    必须携带当前 version，成功后版本 +1，同分重复提交幂等。任何对初评/复评的
+    改分都会立即撤销旧仲裁，撤销后若分差仍超过 1 分可凭新版本重新仲裁。
+    """
+    papers, score_map = _scorable_paper(task_id, paper)
+    selected_ids = papers[paper]
+    examinee_id = _decode_id(examinee_raw, "考生标识")
+    qid, question_key, max_score = _resolve_question(
+        question_raw, selected_ids, score_map
+    )
+    if payload.score > max_score:
+        raise HTTPException(
+            status_code=422,
+            detail=f"仲裁分 {payload.score} 超出第 {qid!r} 题分值上限 {max_score}"
+            f"（允许 0~{max_score} 的整数）",
+        )
+
+    # 仲裁前置条件以当前快照的两评分为准（缺轮 / 分差 <=1 一律拒绝）
+    existing = database.get_paper_score_rows(
+        task_id, paper, scoring.encode_id_key(examinee_id)
+    )
+    state = scoring.question_state(
+        next((r for r in existing if r["question_id"] == question_key), None)
+    )
+    if state["initial_score"] is None or state["review_score"] is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "初评、复评尚未齐备，无法仲裁，请先补评",
+                "code": "awaiting_review",
+            },
+        )
+    if abs(int(state["initial_score"]) - int(state["review_score"])) <= 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "两评分相差不超过 1 分，取均值即为有效分，无需仲裁",
+                "code": "arbitration_not_needed",
+            },
+        )
+
+    code, _ = database.arbitrate_paper_score(
+        task_id,
+        paper,
+        scoring.encode_id_key(examinee_id),
+        question_key,
+        payload.score,
+        payload.version,
+    )
+    if code == "no_score_row":
+        # 理论上前置快照应已命中行；并发被删时保守按缺评处理
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "初评、复评尚未齐备，无法仲裁，请先补评",
+                "code": "awaiting_review",
+            },
+        )
+    if code == "version_missing":
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "仲裁必须携带当前 version", "code": "version_required"},
+        )
+    if code == "version_conflict":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "版本不符：题目已被其他请求改动，未写入",
+                "code": "version_conflict",
+            },
+        )
+    return _build_sheet(task_id, paper, examinee_id, selected_ids)
+
+
+@app.get(
+    "/api/tasks/{task_id}/papers/{paper}/examinees/{examinee_raw}/scores",
+    response_model=PaperScoreSheetOut,
+    response_model_exclude_none=True,
+)
+def get_paper_scores(task_id: int, paper: int, examinee_raw: str) -> PaperScoreSheetOut:
+    """在**同一快照**返回某考生某卷的逐题两评分、有效分、版本与待处理原因。
+
+    题目按首个候选卷组的 ``selected_ids`` 逐题返回（未录分题同样列出，两评分
+    为 null、版本 0、原因为 no_scores）。有效分：两评分齐备且分差不超过 1 取
+    均值，分差超过 1 且有仲裁取仲裁分，其余为 null 并给 pending_reason；
+    **全卷每题均有有效分时**才返回 ``total_score``，否则该字段省略。
+
+    路径中的考生标识以 JSON 编码区分类型：整数 ``42`` 写作 ``42``，字符串
+    ``X7`` 写作 ``%22X7%22``（即 ``"X7"`` 的 URL 编码）——整数 42 与字符串
+    ``"42"`` 是两个不同的考生。
+    """
+    papers, _ = _scorable_paper(task_id, paper)
+    examinee_id = _decode_id(examinee_raw, "考生标识")
+    return _build_sheet(task_id, paper, examinee_id, papers[paper])

@@ -28,6 +28,13 @@ reserved 并冻结 expires_at（结算时刻 + lease_seconds）。持 token 在�
 SHA-256，首事件前驱为 64 个 0（创世哈希）。校验时逐条重算哈希、核对序号与
 前驱，并与 tasks/quota_reservations 表中的实际内容摘要交叉比对，发现首个
 断点即停止，绝不伪报通过。
+
+录分（paper_scores 表）：面向**已完成且可行**任务的首个候选卷组，按
+(卷号, 考生标识, 题号) 持久化初评、复评与仲裁分。考生标识与题号均以 JSON
+编码存储（整数 1 与字符串 "1" 互不冲突）。每题版本从 0 起：首次录分与补评
+填空槽不动版本；改分与仲裁为乐观并发，必须携带当前版本，条件 UPDATE 命中
+后版本 +1，版本不符整句不命中、绝不写入；任何改分在同语句把仲裁分置空
+（旧仲裁立即撤销）。读取在单一只读事务快照内完成，查询所见严格同一时刻。
 """
 from __future__ import annotations
 
@@ -124,6 +131,27 @@ def init_db() -> None:
                 confirmed_at     TEXT,
                 released_at      TEXT,
                 created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        # 录分：已完成可行任务首个候选卷组上，按 (卷号, 考生, 题) 存初评/复评/仲裁。
+        # examinee_id / question_id 均为 JSON 编码（整数 1 与字符串 "1" 互不冲突）。
+        # version 从 0 起：首次录分/补评填空槽不动版本；改分与仲裁为乐观并发，
+        # 必须携带当前版本，命中后 version+1，版本不符的写入整句不命中、绝不落库。
+        # 任何改分在同一条 UPDATE 内把 arbitration_score 置空（旧仲裁立即撤销）。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_scores (
+                task_id           INTEGER NOT NULL,
+                paper             INTEGER NOT NULL,
+                examinee_id       TEXT NOT NULL,
+                question_id       TEXT NOT NULL,
+                initial_score     INTEGER CHECK (initial_score IS NULL OR initial_score >= 0),
+                review_score      INTEGER CHECK (review_score IS NULL OR review_score >= 0),
+                arbitration_score INTEGER CHECK (arbitration_score IS NULL OR arbitration_score >= 0),
+                version           INTEGER NOT NULL DEFAULT 0,
+                updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (task_id, paper, examinee_id, question_id)
             )
             """
         )
@@ -1057,3 +1085,185 @@ def reclaim_expired_leases() -> Dict[str, Any]:
         "returned_total": returned_total,
         "reclaimed": reclaimed_items,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 录分：已完成可行任务首个候选卷组上的初评/复评/仲裁（乐观版本，事务内原子写入）
+# --------------------------------------------------------------------------- #
+def _score_row(
+    conn: sqlite3.Connection,
+    task_id: int,
+    paper: int,
+    examinee_key: str,
+    question_key: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT task_id, paper, examinee_id, question_id, initial_score,"
+        " review_score, arbitration_score, version, updated_at"
+        " FROM paper_scores WHERE task_id = ? AND paper = ?"
+        " AND examinee_id = ? AND question_id = ?",
+        (task_id, paper, examinee_key, question_key),
+    ).fetchone()
+
+
+def _score_out(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    return {
+        "task_id": int(row["task_id"]),
+        "paper": int(row["paper"]),
+        "examinee_id": json.loads(row["examinee_id"]),
+        "question_id": json.loads(row["question_id"]),
+        "initial_score": row["initial_score"],
+        "review_score": row["review_score"],
+        "arbitration_score": row["arbitration_score"],
+        "version": int(row["version"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def put_paper_score(
+    task_id: int,
+    paper: int,
+    examinee_key: str,
+    question_key: str,
+    stage: str,
+    score: int,
+    expected_version: Optional[int],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """录入/修改某考生某题的初评或复评分（单事务原子生效）。
+
+    返回 (结果码, 最新行输出或 None)，结果码：
+    - ``recorded``       ：新题首次录分（version 仍为 0）；
+    - ``filled``         ：补评——此前该评分槽为空（初评缺则补初评），版本不变；
+    - ``changed``        ：改分成功，version+1，且旧仲裁在同语句立即撤销；
+    - ``version_missing``：槽内已有分（属改分）但未携带 version；
+    - ``version_conflict``：携带的 version 与当前版本不符，未写入任何内容。
+
+    新旧分相同视为幂等重试（``changed`` 但不递增、不撤仲裁，行仍原样返回）。
+    """
+    score_col = "initial_score" if stage == "initial" else "review_score"
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _score_row(conn, task_id, paper, examinee_key, question_key)
+        if row is None:
+            conn.execute(
+                "INSERT INTO paper_scores"
+                " (task_id, paper, examinee_id, question_id,"
+                "  initial_score, review_score, arbitration_score, version, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, NULL, 0, datetime('now'))",
+                (
+                    task_id, paper, examinee_key, question_key,
+                    score if stage == "initial" else None,
+                    score if stage == "review" else None,
+                ),
+            )
+            code = "recorded"
+        elif row[score_col] is None:
+            # 补评：此前缺该轮评分，填补空槽不动版本（每题版本仍从 0 起）
+            conn.execute(
+                f"UPDATE paper_scores SET {score_col} = ?, updated_at = datetime('now')"
+                " WHERE task_id = ? AND paper = ? AND examinee_id = ? AND question_id = ?",
+                (score, task_id, paper, examinee_key, question_key),
+            )
+            code = "filled"
+        else:
+            current_version = int(row["version"])
+            if expected_version is None:
+                conn.commit()
+                return "version_missing", _score_out(row)
+            if int(expected_version) != current_version:
+                conn.commit()
+                return "version_conflict", _score_out(row)
+            if int(row[score_col]) == int(score):
+                # 幂等重试：同分再次提交，不递增、不撤销仲裁
+                conn.commit()
+                return "changed", _score_out(row)
+            cur = conn.execute(
+                f"UPDATE paper_scores SET {score_col} = ?, arbitration_score = NULL,"
+                " version = version + 1, updated_at = datetime('now')"
+                " WHERE task_id = ? AND paper = ? AND examinee_id = ? AND question_id = ?"
+                " AND version = ?",
+                (score, task_id, paper, examinee_key, question_key, current_version),
+            )
+            # 条件 UPDATE 的行计数是并发裁决：0 行即被抢先改动，绝不覆盖
+            if cur.rowcount != 1:
+                conn.commit()
+                latest = _score_row(conn, task_id, paper, examinee_key, question_key)
+                return "version_conflict", _score_out(latest)
+            code = "changed"
+        final = _score_row(conn, task_id, paper, examinee_key, question_key)
+        conn.commit()
+        return code, _score_out(final)
+
+
+def arbitrate_paper_score(
+    task_id: int,
+    paper: int,
+    examinee_key: str,
+    question_key: str,
+    score: int,
+    expected_version: Optional[int],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """录入/修改仲裁分（单事务原子生效）。允许仲裁（两评分齐备且相差 >1）的
+    前置校验在 HTTP/scoring 层完成；本函数只负责乐观版本写入。
+
+    返回 (结果码, 最新行输出或 None)：
+    - ``arbitrated``      ：写入成功（含与现有仲裁同分的幂等重试，幂等时不递增）；
+    - ``no_score_row``    ：尚无初评/复评记录；
+    - ``version_missing`` ：未携带 version；
+    - ``version_conflict``：版本不符，未写入。
+    """
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _score_row(conn, task_id, paper, examinee_key, question_key)
+        if row is None:
+            conn.commit()
+            return "no_score_row", None
+        current_version = int(row["version"])
+        if expected_version is None:
+            conn.commit()
+            return "version_missing", _score_out(row)
+        if int(expected_version) != current_version:
+            conn.commit()
+            return "version_conflict", _score_out(row)
+        if row["arbitration_score"] is not None and int(row["arbitration_score"]) == int(score):
+            conn.commit()
+            return "arbitrated", _score_out(row)
+        cur = conn.execute(
+            "UPDATE paper_scores SET arbitration_score = ?, version = version + 1,"
+            " updated_at = datetime('now')"
+            " WHERE task_id = ? AND paper = ? AND examinee_id = ? AND question_id = ?"
+            " AND version = ?",
+            (score, task_id, paper, examinee_key, question_key, current_version),
+        )
+        if cur.rowcount != 1:
+            conn.commit()
+            latest = _score_row(conn, task_id, paper, examinee_key, question_key)
+            return "version_conflict", _score_out(latest)
+        final = _score_row(conn, task_id, paper, examinee_key, question_key)
+        conn.commit()
+        return "arbitrated", _score_out(final)
+
+
+def get_paper_score_rows(
+    task_id: int, paper: int, examinee_key: str
+) -> List[sqlite3.Row]:
+    """在**单一只读事务快照**中读取某考生某卷的全部录分行（按主键顺序）。"""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        rows = conn.execute(
+            "SELECT task_id, paper, examinee_id, question_id, initial_score,"
+            " review_score, arbitration_score, version, updated_at"
+            " FROM paper_scores WHERE task_id = ? AND paper = ? AND examinee_id = ?"
+            " ORDER BY rowid",
+            (task_id, paper, examinee_key),
+        ).fetchall()
+        conn.commit()
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

@@ -986,3 +986,118 @@ class SeatPlanOut(BaseModel):
     # —— 无解/错误（不返回任何部分方案）——
     message: Optional[str] = None
     error: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+# 录分（已完成可行任务首个候选卷组；初评/复评/仲裁 + 乐观版本）
+# --------------------------------------------------------------------------- #
+ExamineeId = Union[int, str]
+
+
+class ScoreEntryIn(BaseModel):
+    """录入初评/复评分请求体。
+
+    - 首次录分（该题尚无记录）与补评（填补缺失的初评/复评空槽）无需 version；
+    - 已有该轮分数再提交即为**改分**，必须携带当前 version，成功后版本 +1 并
+      立即撤销旧仲裁；version 缺失返回 422（version_required），不符返回
+      409（version_conflict）且不写入。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    initial_score: Optional[int] = Field(
+        None, ge=0, description="初评分（0 至题目分值的整数）；与 review_score 恰好给一个"
+    )
+    review_score: Optional[int] = Field(
+        None, ge=0, description="复评分（0 至题目分值的整数）；与 initial_score 恰好给一个"
+    )
+    version: Optional[int] = Field(
+        None,
+        ge=0,
+        description="当前题目版本（从 0 起）；仅改分时必须携带，首次录分/补评留空",
+    )
+
+    @model_validator(mode="after")
+    def _exactly_one_stage(self) -> "ScoreEntryIn":
+        provided = [
+            name
+            for name in ("initial_score", "review_score")
+            if getattr(self, name) is not None
+        ]
+        if len(provided) != 1:
+            raise ValueError("initial_score 与 review_score 必须且只能提供一个")
+        return self
+
+    @property
+    def stage(self) -> str:
+        """评分轮次：initial（初评）/ review（复评）。"""
+        return "initial" if self.initial_score is not None else "review"
+
+    @property
+    def score(self) -> int:
+        return int(self.initial_score if self.initial_score is not None else self.review_score)
+
+
+class ArbitrationIn(BaseModel):
+    """仲裁请求体：仅当两评分齐备且相差超过 1 分时允许。
+
+    必须携带当前 version（仲裁属一次修改），成功后版本 +1。任何后续改分都会
+    立即撤销仲裁；仲裁被撤销后再次分差 >1 可重新仲裁（仍须携当前版本）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: int = Field(..., ge=0, description="仲裁分（0 至题目分值的整数）")
+    version: Optional[int] = Field(
+        None,
+        ge=0,
+        description="当前题目版本（从 0 起），必须携带且与服务端一致；缺失返回 422",
+    )
+
+
+class QuestionScoreOut(BaseModel):
+    """单题评分状态（同快照返回两轮评分、有效分、版本与待处理原因）。"""
+
+    question_id: QuestionId
+    initial_score: Optional[int] = Field(None, description="初评分；未录为 null")
+    review_score: Optional[int] = Field(None, description="复评分；未录为 null")
+    arbitration_score: Optional[int] = Field(
+        None, description="仲裁分；无有效仲裁为 null（任何改分都会立即撤销旧仲裁）"
+    )
+    version: int = Field(
+        ..., description="该题当前版本（从 0 起；改分/仲裁成功后 +1，补评填空槽不变）"
+    )
+    effective_score: Optional[Union[int, float]] = Field(
+        None,
+        description=(
+            "有效分：两评分齐备且分差不超过 1 时取均值（差 0 为整数、差 1 为 .5）；"
+            "分差超过 1 时取仲裁分；其余情形为 null"
+        ),
+    )
+    pending_reason: Optional[str] = Field(
+        None,
+        description=(
+            "待处理原因码：no_scores / missing_initial / missing_review / "
+            "awaiting_arbitration；有有效分时为 null"
+        ),
+    )
+    pending_message: Optional[str] = Field(
+        None, description="待处理原因的中文说明；有有效分时为 null"
+    )
+
+
+class PaperScoreSheetOut(BaseModel):
+    """某考生某卷的逐题成绩单；全卷每题均有有效分时才返回总分。"""
+
+    task_id: int
+    paper: int = Field(..., description="卷号（从 0 起，对应首个候选卷组的卷下标）")
+    examinee_id: ExamineeId
+    questions: List[QuestionScoreOut] = Field(
+        ..., description="逐题评分状态（按首个候选卷组 selected_ids 顺序，未录分题同样返回）"
+    )
+    total_score: Optional[Union[int, float]] = Field(
+        None,
+        description=(
+            "整卷总分：每题有效分求和；任一题尚无有效分（等待补评/仲裁）时为 null"
+        ),
+    )
