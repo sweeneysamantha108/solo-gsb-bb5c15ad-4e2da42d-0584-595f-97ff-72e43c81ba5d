@@ -4,9 +4,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import asynccontextmanager
 from pydantic import ValidationError
 
@@ -14,8 +14,10 @@ from . import database
 from .review import solve_review_plan
 from .schemas import (
     OVERRIDABLE_FIELDS,
+    ArbitrationIn,
     AuditEventOut,
     ExamTaskIn,
+    PaperScoresOut,
     QuotaConfirmIn,
     QuotaConfirmOut,
     QuotaLeaseOut,
@@ -26,6 +28,9 @@ from .schemas import (
     ReviewPlanIn,
     ReviewPlanOut,
     ReviseTaskIn,
+    ScoreEntryOut,
+    ScoreQuestionOut,
+    ScoreRecordIn,
     SeatPlanIn,
     SeatPlanOut,
     TaskAuditOut,
@@ -57,9 +62,10 @@ app = FastAPI(
         "可版本化、创建后不可变的组卷模板，"
         "按题号扣减的题目曝光配额及可过期预留租约（lease），"
         "面向已完成且可行任务的盲审分配，"
-        "以及面向已完成且含 2~5 份平行卷的可行任务的考场卷别排布"
+        "面向已完成且含 2~5 份平行卷的可行任务的考场卷别排布，"
+        "以及按首个候选卷组的考生逐题录分、双评均值结算与仲裁（版本化乐观并发）"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -363,7 +369,8 @@ def revise_task(task_id: int, payload: ReviseTaskIn) -> TaskCreated:
     }
     seed = int(source_req.get("seed") or 42)
     name = payload.name if payload.name is not None else row["name"]
-    new_task_id = database.create_task(
+    # create_task 返回 (task_id, reservation_token)；改卷任务不涉及配额租约，token 恒为 None
+    new_task_id, _ = database.create_task(
         name,
         json.dumps(frozen, ensure_ascii=False),
         seed,
@@ -490,6 +497,286 @@ def create_seat_plan(task_id: int, payload: SeatPlanIn) -> SeatPlanOut:
         seed=int(row["seed"]),
     )
     return SeatPlanOut(task_id=task_id, **plan)
+
+
+# --------------------------------------------------------------------------- #
+# 录分与仲裁：按首个候选卷组为考生逐题录分（持久化、每题版本从 0 起的乐观并发）
+# --------------------------------------------------------------------------- #
+def _rank1_paper_questions(result: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    """首个候选卷组（rank 1）的逐卷题目对象列表（单卷 -> 单元素列表）。
+
+    多候选结果以 rank 最小的候选为准；多卷结果取各卷 paper 数组；
+    单卷结果为单元素列表。录分只允许这些卷上的题目。
+    """
+    alts = result.get("alternatives")
+    if alts:
+        top = min(alts, key=lambda a: a.get("rank", 1))
+        if top.get("papers") is not None:
+            return [list(p.get("paper") or []) for p in top["papers"]]
+        return [list(top.get("paper") or [])]
+    if result.get("papers") is not None:
+        return [list(p.get("paper") or []) for p in result["papers"]]
+    return [list(result.get("paper") or [])]
+
+
+def _check_scoring_task(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
+    """校验任务可录分：存在、已完成、结果可行；返回可行结果 JSON。"""
+    if row is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] != "done":
+        raise HTTPException(status_code=422, detail="任务尚未完成，无法录分")
+    if not row["result"]:
+        raise HTTPException(status_code=422, detail="任务尚无结果，无法录分")
+    result = json.loads(row["result"])
+    if result.get("status") != "feasible":
+        raise HTTPException(status_code=422, detail="任务结果不可行，无法录分")
+    return result
+
+
+def _paper_questions_or_422(
+    papers: List[List[Dict[str, Any]]], paper: int
+) -> List[Dict[str, Any]]:
+    """按卷号取首个候选卷组中该卷的题目列表；卷号越界返回 422。"""
+    if paper >= len(papers):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"卷号 {paper} 不存在：首个候选卷组共 {len(papers)} 份卷"
+                f"（卷号 0~{len(papers) - 1}）"
+            ),
+        )
+    return papers[paper]
+
+
+def _find_question(
+    questions: List[Dict[str, Any]], question_id: Any
+) -> Optional[Dict[str, Any]]:
+    """在该卷题目中按题号精确查找（整数与字符串题号严格区分）。"""
+    for q in questions:
+        if q.get("id") == question_id and type(q.get("id")) is type(question_id):
+            return q
+    return None
+
+
+def _effective_and_pending(
+    first: Optional[int], second: Optional[int], arbitration: Optional[int]
+) -> Tuple[Optional[float], Optional[str]]:
+    """计算有效分与待处理原因。
+
+    有效分：有仲裁取仲裁分；否则两评分齐备且相差不超过 1 分取均值；
+    其余为 None 并给出待处理原因（待初评/待复评/待补录/待仲裁）。
+    """
+    if arbitration is not None:
+        return float(arbitration), None
+    if first is not None and second is not None:
+        if abs(first - second) <= 1:
+            return (first + second) / 2, None
+        return None, "awaiting_arbitration"
+    if first is None and second is None:
+        return None, "awaiting_both_reviews"
+    if first is None:
+        return None, "awaiting_first_review"
+    return None, "awaiting_second_review"
+
+
+def _score_entry_out(
+    task_id: int, action: str, max_score: int, entry: Dict[str, Any]
+) -> ScoreEntryOut:
+    """由录分行字典构造单题评分状态响应。"""
+    effective, pending = _effective_and_pending(
+        entry["first_score"], entry["second_score"], entry["arbitration_score"]
+    )
+    return ScoreEntryOut(
+        task_id=task_id,
+        paper=entry["paper"],
+        examinee_id=entry["examinee_id"],
+        question_id=entry["question_id"],
+        action=action,
+        max_score=max_score,
+        first_score=entry["first_score"],
+        second_score=entry["second_score"],
+        arbitration_score=entry["arbitration_score"],
+        effective_score=effective,
+        version=entry["version"],
+        pending_reason=pending,
+    )
+
+
+def _score_write_target(task_id: int, paper: int, question_id: Any) -> Dict[str, Any]:
+    """录分类接口的公共校验：任务可录分、卷号越界、题号须为该卷题目。"""
+    row = database.get_task(task_id)
+    result = _check_scoring_task(row)
+    papers = _rank1_paper_questions(result)
+    questions = _paper_questions_or_422(papers, paper)
+    question = _find_question(questions, question_id)
+    if question is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"题号 {question_id!r} 不在第 {paper} 卷题目中，仅允许该卷题目录分",
+        )
+    return question
+
+
+@app.post("/api/tasks/{task_id}/scores", response_model=ScoreEntryOut)
+def record_score(task_id: int, payload: ScoreRecordIn) -> ScoreEntryOut:
+    """为已完成且可行任务的**首个候选卷组**录入某考生某题的初评/复评分。
+
+    - 仅允许该卷题目；分数为 0 至题目分值的整数；整数与字符串题号严格区分；
+    - 该轮（初评/复评）尚无评分时为**首次录分**：不得携带 version，每题版本从 0 起；
+    - 该轮已有评分时为**改分**：必须携带当前 version，命中后版本 +1，并立即
+      撤销旧仲裁；版本不符返回 409 且不写入；
+    - 任务不存在 404；任务未完成 / 结果不可行 / 输入非法 422。
+    """
+    question = _score_write_target(task_id, payload.paper, payload.question_id)
+    max_score = int(question["score"])
+    if payload.score > max_score:
+        raise HTTPException(
+            status_code=422,
+            detail=f"分数 {payload.score} 超出题目分值上限 {max_score}（须为 0~{max_score} 的整数）",
+        )
+
+    code, entry = database.record_score(
+        task_id,
+        payload.paper,
+        payload.examinee_id,
+        payload.question_id,
+        payload.round,
+        payload.score,
+        payload.version,
+    )
+    if code == "unexpected_version":
+        raise HTTPException(
+            status_code=422,
+            detail="该题该轮评分尚未录入，首次录分无需携带版本号 version",
+        )
+    if code == "version_required":
+        raise HTTPException(
+            status_code=422,
+            detail="该题该轮已有评分，改分必须携带当前版本号 version",
+        )
+    if code == "version_conflict":
+        raise HTTPException(status_code=409, detail="版本号不符，本次未写入")
+    return _score_entry_out(task_id, code, max_score, entry)
+
+
+@app.post("/api/tasks/{task_id}/scores/arbitrate", response_model=ScoreEntryOut)
+def arbitrate_score(task_id: int, payload: ArbitrationIn) -> ScoreEntryOut:
+    """对两评分相差超过 1 分的题写入仲裁分（须携当前版本，成功后版本 +1）。
+
+    - 仅限初评与复评齐备且相差超过 1 分：未齐备或相差不超过 1 分返回 422；
+    - 仲裁分须为 0 至题目分值的整数；版本不符返回 409 且不写入；
+    - 任何改分都会立即撤销旧仲裁（仲裁分随之失效，需重新满足条件后再仲裁）。
+    """
+    question = _score_write_target(task_id, payload.paper, payload.question_id)
+    max_score = int(question["score"])
+    if payload.score > max_score:
+        raise HTTPException(
+            status_code=422,
+            detail=f"仲裁分 {payload.score} 超出题目分值上限 {max_score}（须为 0~{max_score} 的整数）",
+        )
+
+    code, entry = database.arbitrate_score(
+        task_id,
+        payload.paper,
+        payload.examinee_id,
+        payload.question_id,
+        payload.score,
+        payload.version,
+    )
+    if code == "not_ready":
+        raise HTTPException(
+            status_code=422, detail="初评与复评未齐备，不能仲裁"
+        )
+    if code == "not_needed":
+        raise HTTPException(
+            status_code=422,
+            detail="两评分相差不超过 1 分，不满足仲裁条件（取均值即可结算）",
+        )
+    if code == "version_conflict":
+        raise HTTPException(status_code=409, detail="版本号不符，本次未写入")
+    return _score_entry_out(task_id, code, max_score, entry)
+
+
+def _parse_examinee_param(raw: str) -> Any:
+    """解析查询参数中的考生标识。
+
+    考生标识在录分时可为数字或字符串（JSON 编码区分）。查询参数一律按
+    JSON 解析：`1001` 为整数标识、`"S001"`（带引号）为字符串标识；不是合法
+    JSON 的裸字符串（如 `S001`）按字符串标识处理。其余 JSON 类型（浮点数、
+    布尔、数组、对象、null）非法。
+    """
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return raw
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise HTTPException(
+            status_code=422,
+            detail="examinee_id 须为整数或字符串（字符串标识可裸写或加 JSON 引号）",
+        )
+    return value
+
+
+@app.get("/api/tasks/{task_id}/scores", response_model=PaperScoresOut)
+def get_paper_scores(
+    task_id: int,
+    paper: int = Query(..., ge=0, description="卷号（从 0 起）"),
+    examinee_id: str = Query(
+        ...,
+        description="考生标识：JSON 编码（1001 为整数、\"S001\" 为字符串）；裸字符串按字符串处理",
+    ),
+) -> PaperScoresOut:
+    """在同一快照中返回某考生某卷逐题的两评分、有效分、版本及待处理原因。
+
+    全卷每题均有有效分时 `complete=true` 并返回总分 `total_score`；
+    否则 `total_score` 为 null，逐题 `pending_reason` 标明待处理原因。
+    """
+    examinee = _parse_examinee_param(examinee_id)
+    # 任务行与该考生该卷的全部录分行在单一只读事务快照中读取
+    row, score_rows = database.get_scores_snapshot(task_id, paper, examinee)
+    result = _check_scoring_task(row)
+    papers = _rank1_paper_questions(result)
+    questions = _paper_questions_or_422(papers, paper)
+
+    entries = {
+        r["question_id"]: r for r in score_rows
+    }  # 键为 JSON 编码题号（数据库原样存储）
+    out_questions: List[ScoreQuestionOut] = []
+    total: float = 0.0
+    complete = True
+    for q in questions:
+        r = entries.get(json.dumps(q["id"], ensure_ascii=False))
+        first = r["first_score"] if r else None
+        second = r["second_score"] if r else None
+        arbitration = r["arbitration"] if r else None
+        version = int(r["version"]) if r else 0
+        effective, pending = _effective_and_pending(first, second, arbitration)
+        if effective is None:
+            complete = False
+        else:
+            total += effective
+        out_questions.append(
+            ScoreQuestionOut(
+                question_id=q["id"],
+                max_score=int(q["score"]),
+                first_score=first,
+                second_score=second,
+                arbitration_score=arbitration,
+                effective_score=effective,
+                version=version,
+                pending_reason=pending,
+            )
+        )
+
+    return PaperScoresOut(
+        task_id=task_id,
+        paper=paper,
+        examinee_id=examinee,
+        paper_count=len(papers),
+        complete=complete,
+        total_score=total if complete else None,
+        questions=out_questions,
+    )
 
 
 @app.get(

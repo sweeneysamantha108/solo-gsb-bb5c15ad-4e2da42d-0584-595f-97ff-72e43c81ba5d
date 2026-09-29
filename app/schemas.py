@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -986,3 +986,132 @@ class SeatPlanOut(BaseModel):
     # —— 无解/错误（不返回任何部分方案）——
     message: Optional[str] = None
     error: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+# 录分与仲裁（POST/GET /api/tasks/{task_id}/scores）
+# --------------------------------------------------------------------------- #
+#: 考生标识：数字或字符串（与题号同口径，整数 1 与字符串 "1" 是不同考生）
+ExamineeId = Union[int, str]
+
+#: 评分轮次：first=初评，second=复评
+ScoreRound = Literal["first", "second"]
+
+#: 待处理原因取值（effective_score 为 null 时必返其一，否则为 null）：
+#: awaiting_first_review（待初评）/ awaiting_second_review（待复评）/
+#: awaiting_both_reviews（初评复评均待录）/ awaiting_arbitration（两评分相差
+#: 超过 1 分，待仲裁）
+PENDING_REASONS = (
+    "awaiting_first_review",
+    "awaiting_second_review",
+    "awaiting_both_reviews",
+    "awaiting_arbitration",
+)
+
+
+class ScoreRecordIn(BaseModel):
+    """录分/改分请求：为某考生某卷某题录入初评或复评分。
+
+    该轮尚无评分时为首次录分（不得携带 version）；该轮已有评分时为改分
+    （必须携带当前 version，命中后版本 +1 并立即撤销旧仲裁）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paper: int = Field(..., ge=0, description="卷号（从 0 起，与组卷结果卷下标一致）")
+    examinee_id: ExamineeId = Field(..., description="考生标识（数字或字符串）")
+    question_id: QuestionId = Field(
+        ..., description="题号（数字或字符串，须为该卷题目；整数与字符串题号区分）"
+    )
+    round: ScoreRound = Field(..., description="评分轮次：first=初评 / second=复评")
+    score: int = Field(..., ge=0, description="分数：0 至题目分值的整数")
+    version: Optional[int] = Field(
+        None,
+        ge=0,
+        description=(
+            "改分时必填的当前版本号（乐观并发控制）；首次录分不得携带。"
+            "版本不符返回 409 且不写入"
+        ),
+    )
+
+
+class ArbitrationIn(BaseModel):
+    """仲裁请求：对两评分相差超过 1 分的题写入仲裁分（须携当前版本）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    paper: int = Field(..., ge=0, description="卷号（从 0 起）")
+    examinee_id: ExamineeId = Field(..., description="考生标识（数字或字符串）")
+    question_id: QuestionId = Field(..., description="题号（须为该卷题目）")
+    score: int = Field(..., ge=0, description="仲裁分：0 至题目分值的整数")
+    version: int = Field(
+        ..., ge=0, description="当前版本号；版本不符返回 409 且不写入"
+    )
+
+
+class ScoreEntryOut(BaseModel):
+    """单题评分状态（录分/改分/仲裁接口的响应）。"""
+
+    task_id: int
+    paper: int = Field(..., description="卷号（从 0 起）")
+    examinee_id: ExamineeId
+    question_id: QuestionId
+    action: str = Field(
+        ..., description="本次动作：recorded（首次录分）/ modified（改分）/ arbitrated（仲裁）"
+    )
+    max_score: int = Field(..., description="题目分值（分数上限）")
+    first_score: Optional[int] = Field(None, description="初评分（未录为 null）")
+    second_score: Optional[int] = Field(None, description="复评分（未录为 null）")
+    arbitration_score: Optional[int] = Field(
+        None, description="当前有效仲裁分（无或已被改分撤销为 null）"
+    )
+    effective_score: Optional[float] = Field(
+        None,
+        description=(
+            "有效分：有仲裁取仲裁分；否则两评分齐备且相差不超过 1 分取均值；"
+            "其余情况为 null（待补评或待仲裁）"
+        ),
+    )
+    version: int = Field(..., description="当前版本号（每题从 0 起，改分/仲裁成功 +1）")
+    pending_reason: Optional[str] = Field(
+        None,
+        description=(
+            "待处理原因（effective_score 为 null 时必返）：awaiting_first_review / "
+            "awaiting_second_review / awaiting_both_reviews / awaiting_arbitration"
+        ),
+    )
+
+
+class ScoreQuestionOut(BaseModel):
+    """查询结果中某考生某卷单题的评分状态。"""
+
+    question_id: QuestionId
+    max_score: int = Field(..., description="题目分值（分数上限）")
+    first_score: Optional[int] = Field(None, description="初评分（未录为 null）")
+    second_score: Optional[int] = Field(None, description="复评分（未录为 null）")
+    arbitration_score: Optional[int] = Field(None, description="当前有效仲裁分")
+    effective_score: Optional[float] = Field(
+        None, description="有效分（规则同 ScoreEntryOut；不可结算时为 null）"
+    )
+    version: int = Field(..., description="当前版本号（每题从 0 起）")
+    pending_reason: Optional[str] = Field(
+        None, description="待处理原因（effective_score 为 null 时必返）"
+    )
+
+
+class PaperScoresOut(BaseModel):
+    """某考生某卷全部题目的评分快照（单一只读事务中取出）。"""
+
+    task_id: int
+    paper: int = Field(..., description="卷号（从 0 起）")
+    examinee_id: ExamineeId
+    paper_count: int = Field(..., description="首个候选卷组的卷数")
+    complete: bool = Field(
+        ..., description="全卷每题是否均已有有效分（为 true 时 total_score 必返）"
+    )
+    total_score: Optional[float] = Field(
+        None, description="全卷有效分总和；仅当每题均有有效分时返回，否则为 null"
+    )
+    questions: List[ScoreQuestionOut] = Field(
+        ..., description="该卷全部题目（按卷内题目顺序）的逐题评分状态"
+    )

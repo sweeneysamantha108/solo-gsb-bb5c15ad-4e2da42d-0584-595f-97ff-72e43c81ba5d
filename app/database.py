@@ -28,6 +28,12 @@ reserved 并冻结 expires_at（结算时刻 + lease_seconds）。持 token 在�
 SHA-256，首事件前驱为 64 个 0（创世哈希）。校验时逐条重算哈希、核对序号与
 前驱，并与 tasks/quota_reservations 表中的实际内容摘要交叉比对，发现首个
 断点即停止，绝不伪报通过。
+
+录分（paper_scores 表）：按（任务、卷号、考生标识、题号）持久化初评/复评/
+仲裁分。每题版本从 0 起（首次录分建行即 0，录分不递增）；改分与仲裁必须携带
+当前版本，命中则版本 +1，不符则不写入并由接口返回 409。所有“读-判-写”都在
+进程内互斥锁 + BEGIN IMMEDIATE 的单个事务中完成，并发录分/改分/仲裁严格串行；
+任何改分在同一 UPDATE 中把旧仲裁置空（立即撤销）。
 """
 from __future__ import annotations
 
@@ -142,6 +148,26 @@ def init_db() -> None:
                 prev_hash  TEXT NOT NULL,
                 hash       TEXT NOT NULL,
                 UNIQUE (task_id, seq)
+            )
+            """
+        )
+        # 录分：每（任务、卷号、考生、题号）一行。题号与考生标识存 JSON 编码
+        # （整数 1 与字符串 "1" 互不冲突）。version 从 0 起：首次录分建行即 0，
+        # 录分本身不递增；改分/仲裁命中当前版本才 +1。arbitration 为当前有效
+        # 仲裁分（可空），任何改分在同一 UPDATE 中将其置空（立即撤销旧仲裁）。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_scores (
+                task_id     INTEGER NOT NULL,
+                paper       INTEGER NOT NULL,
+                examinee_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                first_score  INTEGER,
+                second_score INTEGER,
+                arbitration  INTEGER,
+                version     INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (task_id, paper, examinee_id, question_id)
             )
             """
         )
@@ -1057,3 +1083,170 @@ def reclaim_expired_leases() -> Dict[str, Any]:
         "returned_total": returned_total,
         "reclaimed": reclaimed_items,
     }
+
+
+# --------------------------------------------------------------------------- #
+# 录分：初评/复评/仲裁的持久化与乐观并发（版本从 0 起，改分/仲裁携版本 +1）
+# --------------------------------------------------------------------------- #
+def _score_row_out(row: sqlite3.Row) -> Dict[str, Any]:
+    """把 paper_scores 行转换为接口可用的字典（题号/考生标识还原 JSON 编码）。"""
+    return {
+        "task_id": int(row["task_id"]),
+        "paper": int(row["paper"]),
+        "examinee_id": json.loads(row["examinee_id"]),
+        "question_id": json.loads(row["question_id"]),
+        "first_score": row["first_score"],
+        "second_score": row["second_score"],
+        "arbitration_score": row["arbitration"],
+        "version": int(row["version"]),
+    }
+
+
+def _fetch_score_row(
+    conn: sqlite3.Connection, task_id: int, paper: int, ekey: str, qkey: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT task_id, paper, examinee_id, question_id, first_score,"
+        " second_score, arbitration, version FROM paper_scores"
+        " WHERE task_id = ? AND paper = ? AND examinee_id = ? AND question_id = ?",
+        (task_id, paper, ekey, qkey),
+    ).fetchone()
+
+
+def record_score(
+    task_id: int,
+    paper: int,
+    examinee_id: Any,
+    question_id: Any,
+    round_: str,
+    score: int,
+    version: Optional[int],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """录入或修改某考生某卷某题的初评/复评分（原子校验版本）。
+
+    round_ 为 "first"（初评）或 "second"（复评）。返回 (结果码, 行字典或 None)：
+    - ``recorded``          ：该轮此前无评分，首次录分成功（版本保持 0 不变）；
+    - ``modified``          ：该轮已有评分，携带版本命中，改分成功、版本 +1，
+      并在同一 UPDATE 中撤销旧仲裁（arbitration 置空）；
+    - ``unexpected_version``：该轮尚无评分（首次录分）却携带了版本；
+    - ``version_required``  ：该轮已有评分（属于改分）但未携带版本；
+    - ``version_conflict``  ：携带版本与当前版本不符（不写入）。
+
+    读-判-写全程在进程内互斥锁 + BEGIN IMMEDIATE 的单个事务中，并发写严格串行。
+    """
+    ekey, qkey = _qkey(examinee_id), _qkey(question_id)
+    col = "first_score" if round_ == "first" else "second_score"
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _fetch_score_row(conn, task_id, paper, ekey, qkey)
+        existing = row[col] if row is not None else None
+
+        if existing is None:
+            # 首次录分：不需要也不接受版本号；每题版本从 0 起，录分不递增
+            if version is not None:
+                return "unexpected_version", None
+            if row is None:
+                conn.execute(
+                    "INSERT INTO paper_scores"
+                    " (task_id, paper, examinee_id, question_id,"
+                    f"  {col}, version, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, 0, datetime('now'))",
+                    (task_id, paper, ekey, qkey, int(score)),
+                )
+            else:
+                conn.execute(
+                    f"UPDATE paper_scores SET {col} = ?,"
+                    " updated_at = datetime('now')"
+                    " WHERE task_id = ? AND paper = ? AND examinee_id = ?"
+                    " AND question_id = ?",
+                    (int(score), task_id, paper, ekey, qkey),
+                )
+            code = "recorded"
+        else:
+            # 改分：必须携带当前版本；命中则版本 +1 并立即撤销旧仲裁
+            if version is None:
+                return "version_required", None
+            if int(version) != int(row["version"]):
+                return "version_conflict", None
+            conn.execute(
+                f"UPDATE paper_scores SET {col} = ?, arbitration = NULL,"
+                " version = version + 1, updated_at = datetime('now')"
+                " WHERE task_id = ? AND paper = ? AND examinee_id = ?"
+                " AND question_id = ?",
+                (int(score), task_id, paper, ekey, qkey),
+            )
+            code = "modified"
+
+        out = _fetch_score_row(conn, task_id, paper, ekey, qkey)
+        return code, _score_row_out(out)
+
+
+def arbitrate_score(
+    task_id: int,
+    paper: int,
+    examinee_id: Any,
+    question_id: Any,
+    score: int,
+    version: int,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """对两评分相差超过 1 分的题写入仲裁分（原子校验版本）。
+
+    返回 (结果码, 行字典或 None)：
+    - ``arbitrated``       ：仲裁成功，版本 +1；
+    - ``not_ready``        ：初评/复评未齐备，不能仲裁；
+    - ``not_needed``       ：两评分相差不超过 1 分，不满足仲裁条件；
+    - ``version_conflict`` ：携带版本与当前版本不符（不写入）。
+    """
+    ekey, qkey = _qkey(examinee_id), _qkey(question_id)
+    with _lock, get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _fetch_score_row(conn, task_id, paper, ekey, qkey)
+        if (
+            row is None
+            or row["first_score"] is None
+            or row["second_score"] is None
+        ):
+            return "not_ready", None
+        if abs(int(row["first_score"]) - int(row["second_score"])) <= 1:
+            return "not_needed", None
+        if int(version) != int(row["version"]):
+            return "version_conflict", None
+        conn.execute(
+            "UPDATE paper_scores SET arbitration = ?,"
+            " version = version + 1, updated_at = datetime('now')"
+            " WHERE task_id = ? AND paper = ? AND examinee_id = ?"
+            " AND question_id = ?",
+            (int(score), task_id, paper, ekey, qkey),
+        )
+        out = _fetch_score_row(conn, task_id, paper, ekey, qkey)
+        return "arbitrated", _score_row_out(out)
+
+
+def get_scores_snapshot(
+    task_id: int, paper: int, examinee_id: Any
+) -> Tuple[Optional[sqlite3.Row], List[sqlite3.Row]]:
+    """在**单一只读事务快照**中读取任务行与某考生某卷的全部录分行。
+
+    任务结果（done 后不可变）与该考生该卷的逐题评分严格处于同一时刻，
+    查询接口据此一次性返回逐题两评分、有效分、版本及待处理原因。
+    """
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT task_id, paper, examinee_id, question_id, first_score,"
+            " second_score, arbitration, version FROM paper_scores"
+            " WHERE task_id = ? AND paper = ? AND examinee_id = ?"
+            " ORDER BY rowid",
+            (task_id, paper, _qkey(examinee_id)),
+        ).fetchall()
+        conn.commit()
+        return task, rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

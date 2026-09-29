@@ -18,6 +18,8 @@
 
 每个异步任务还附带一条**防篡改审计链**（`GET /api/tasks/{task_id}/audit`）：任务创建、开始、完成或失败、配额结算均在**对应业务写入的同一 SQLite 事务内**追加哈希链接事件（规范化 JSON + SHA-256，含前驱哈希）；接口重放整条链并与任务/配额业务表交叉校验，发现序号、前驱哈希或内容摘要异常时返回**首个断点**，绝不伪报通过，详见下文[防篡改审计链](#防篡改审计链)。
 
+还提供**录分与仲裁**（`POST /api/tasks/{task_id}/scores` 等）：按已完成且可行任务的**首个候选卷组**为考生逐题录入初评/复评分——仅允许该卷题目、分数为 0 至题目分值的整数、整数与字符串题号严格区分；录分持久化且**每题版本从 0 起**，改分与仲裁须携当前版本（成功后 +1，版本不符返回 409 且不写入）；两评分齐备且相差不超过 1 分取均值，相差超过 1 分方可仲裁，任何改分立即撤销旧仲裁；查询在**同一快照**返回逐题两评分、有效分、版本及待处理原因，全卷每题均有有效分才返回总分，详见下文[录分与仲裁](#录分与仲裁post-apitaskstask_idscores)。
+
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
 
 ## 启动
@@ -28,7 +30,7 @@
 docker compose up --build        # 前台运行；加 -d 后台运行
 ```
 
-容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases 与 task_audit_events 表），无需任何手动初始化。
+容器启动时自动安装依赖并创建 SQLite 数据库（含 tasks、templates、quotas、quota_reservations、quota_leases、task_audit_events 与 paper_scores 表），无需任何手动初始化。
 
 - API 地址：http://localhost:8000
 - 端口：`8000`（宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 修改）
@@ -62,6 +64,9 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/api/quotas` | 查询全部题号的当前剩余可用次数 |
 | `POST` | `/api/quotas/reclaim-expired` | **回收**所有已过期且未确认的预留租约（原子释放、逐题返还；幂等） |
 | `POST` | `/api/tasks/{task_id}/quota/confirm` | 凭 reservation_token **主动确认**预留（重复/过期确认幂等） |
+| `POST` | `/api/tasks/{task_id}/scores` | 按首个候选卷组为考生**录入/修改**某题的初评或复评分（改分须携当前版本） |
+| `POST` | `/api/tasks/{task_id}/scores/arbitrate` | 对两评分相差超过 1 分的题写入**仲裁分**（须携当前版本） |
+| `GET`  | `/api/tasks/{task_id}/scores` | 同一快照查询某考生某卷逐题两评分、有效分、版本及待处理原因（全卷齐备才返回总分） |
 | `GET`  | `/health` | 健康检查 |
 
 任务状态：`pending` → `running` → `done`；结果在 `result` 字段中返回（`feasible` / `infeasible` / `error` / `quota_exceeded`）。
@@ -1016,6 +1021,148 @@ curl http://localhost:8000/api/tasks/21/audit
 ```
 
 > 审计事件表只追加，服务不提供任何修改/删除接口；`last_hash` 可作为外部留存的链顶锚点，与历史响应中的值逐次比对即可发现库被离线改写。
+
+## 录分与仲裁（`POST /api/tasks/{task_id}/scores`）
+
+为**已完成且结果可行**的组卷任务按**首个候选卷组**（多候选结果取 `rank: 1`，单候选即结果本身；单卷/多卷/模板/改卷任务同口径）为考生逐题录入评分。录分持久化于 `paper_scores` 表，按（任务、卷号、考生标识、题号）唯一建档，全部“读-判-写”在进程内互斥锁 + `BEGIN IMMEDIATE` 的单个 SQLite 事务中完成，并发写严格串行。
+
+- 源任务仅允许状态为 `done` 且结果为 `feasible`：任务不存在返回 `404`；未完成、无结果或结果不可行返回 `422`。
+- 每条评分指定**卷号**（`paper`，从 0 起）、**考生标识**（`examinee_id`，数字或字符串）、**题号**（`question_id`）与**轮次**（`round`：`first` 初评 / `second` 复评）。
+- **仅允许该卷题目**：题号必须属于首个候选卷组中该卷的题目，否则 `422`；整数与字符串题号严格区分（`1` 与 `"1"` 是两道题）。
+- **分数为 0 至题目分值的整数**：负分、小数、超过该题 `score` 的分值均 `422`。
+- **每题版本从 0 起**：首次录分建行即版本 0，录分本身不递增版本；**改分与仲裁必须携带当前版本**，命中后版本 +1，版本不符返回 `409` 且不写入（乐观并发控制）。
+- **有效分结算**：有仲裁取仲裁分；否则两评分齐备且相差不超过 1 分取**均值**（可能为 `x.5`）；其余情况无有效分，等待补评或仲裁。
+- **仲裁仅限两评分相差超过 1 分**（且初评、复评齐备），仲裁分须为 0 至题目分值的整数；**任何改分立即撤销旧仲裁**（仲裁分随之失效）。
+
+### 录分 / 改分（`POST /api/tasks/{task_id}/scores`）
+
+```bash
+# 首次录分（初评）：不得携带 version
+curl -X POST http://localhost:8000/api/tasks/42/scores \
+  -H "Content-Type: application/json" \
+  -d '{"paper": 0, "examinee_id": "S001", "question_id": 1,
+       "round": "first", "score": 4}'
+
+# 录复评（第二评分，同样无需 version）：4 与 5 相差 1 分，取均值 4.5
+curl -X POST http://localhost:8000/api/tasks/42/scores \
+  -H "Content-Type: application/json" \
+  -d '{"paper": 0, "examinee_id": "S001", "question_id": 1,
+       "round": "second", "score": 5}'
+
+# 改分：必须携带当前版本（上例中版本为 0），成功后版本 +1
+curl -X POST http://localhost:8000/api/tasks/42/scores \
+  -H "Content-Type: application/json" \
+  -d '{"paper": 0, "examinee_id": "S001", "question_id": 1,
+       "round": "first", "score": 2, "version": 0}'
+```
+
+响应（改分后：2 与 5 相差 3 分，待仲裁）：
+
+```json
+{
+  "task_id": 42,
+  "paper": 0,
+  "examinee_id": "S001",
+  "question_id": 1,
+  "action": "modified",
+  "max_score": 5,
+  "first_score": 2,
+  "second_score": 5,
+  "arbitration_score": null,
+  "effective_score": null,
+  "version": 1,
+  "pending_reason": "awaiting_arbitration"
+}
+```
+
+- `action`：`recorded`（首次录分）/ `modified`（改分）/ `arbitrated`（仲裁）；
+- 该轮尚无评分时携带 `version`、该轮已有评分却未携带 `version`，均返回 `422`；
+- `version` 与当前版本不符返回 `409` 且**不写入**。
+
+### 仲裁（`POST /api/tasks/{task_id}/scores/arbitrate`）
+
+仅限初评与复评齐备且**相差超过 1 分**的题；须携当前版本，成功后版本 +1：
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/42/scores/arbitrate \
+  -H "Content-Type: application/json" \
+  -d '{"paper": 0, "examinee_id": "S001", "question_id": 1,
+       "score": 4, "version": 1}'
+```
+
+```json
+{
+  "task_id": 42,
+  "paper": 0,
+  "examinee_id": "S001",
+  "question_id": 1,
+  "action": "arbitrated",
+  "max_score": 5,
+  "first_score": 2,
+  "second_score": 5,
+  "arbitration_score": 4,
+  "effective_score": 4.0,
+  "version": 2,
+  "pending_reason": null
+}
+```
+
+两评分未齐备（`not_ready`）或相差不超过 1 分（`not_needed`）返回 `422`；版本不符返回 `409`。此后任何改分立即撤销该仲裁（`arbitration_score` 置空），两评分重新按均值/待仲裁规则结算。
+
+### 查询（`GET /api/tasks/{task_id}/scores`）
+
+在**单一只读事务快照**中返回某考生某卷全部题目的两评分、有效分、版本及待处理原因；**全卷每题均有有效分才返回总分**：
+
+```bash
+curl "http://localhost:8000/api/tasks/42/scores?paper=0&examinee_id=S001"
+```
+
+- `paper`：卷号（从 0 起），越界返回 `422`；
+- `examinee_id`：考生标识，按 JSON 编码解析——`1001` 为整数标识、`"S001"`（带引号）为字符串标识；不是合法 JSON 的裸字符串（如 `S001`）按字符串标识处理；整数与字符串考生标识互不混淆。
+
+```json
+{
+  "task_id": 42,
+  "paper": 0,
+  "examinee_id": "S001",
+  "paper_count": 1,
+  "complete": false,
+  "total_score": null,
+  "questions": [
+    {
+      "question_id": 1,
+      "max_score": 5,
+      "first_score": 2,
+      "second_score": 5,
+      "arbitration_score": 4,
+      "effective_score": 4.0,
+      "version": 2,
+      "pending_reason": null
+    },
+    {
+      "question_id": 2,
+      "max_score": 5,
+      "first_score": null,
+      "second_score": null,
+      "arbitration_score": null,
+      "effective_score": null,
+      "version": 0,
+      "pending_reason": "awaiting_both_reviews"
+    }
+  ]
+}
+```
+
+- `pending_reason`（`effective_score` 为 null 时必返）：`awaiting_first_review`（待初评）/ `awaiting_second_review`（待复评）/ `awaiting_both_reviews`（初评复评均待录）/ `awaiting_arbitration`（两评分相差超过 1 分，待仲裁）；
+- `complete`：全卷每题均已有有效分；仅当 `complete=true` 时返回 `total_score`（各题有效分之和，均值结算可能产生 `x.5`），否则 `total_score` 为 `null`；
+- 尚未录分的题按版本 0、两评分与仲裁分全 `null` 返回。
+
+### 拒绝情形
+
+- 任务不存在：`404`；任务未完成 / 无结果 / 结果不可行（含 `infeasible`、`error`、`quota_exceeded`）：`422`；
+- 卷号越界、题号不属于该卷、分数越界（负分/小数/超过题目分值）、非法轮次、未知字段：`422`；
+- 首次录分携带版本、改分未携带版本：`422`；改分/仲裁版本不符：`409`（不写入）；
+- 仲裁时两评分未齐备或相差不超过 1 分：`422`。
 
 ## 可行结果
 
